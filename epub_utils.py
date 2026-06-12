@@ -1,11 +1,11 @@
 import os
+import re
 import zipfile
 import tempfile
 import mimetypes
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote
-from datetime import datetime
 
 NS = {
     "container": "urn:oasis:names:tc:opendocument:xmlns:container",
@@ -37,6 +37,7 @@ class EpubEditor:
         self.cover_item = None
         self.cover_zip_path = None
         self.file_rows = []
+        self.names = []
         self._read()
 
     def _read(self):
@@ -46,8 +47,9 @@ class EpubEditor:
 
         try:
             with zipfile.ZipFile(tmp_path, "r") as zf:
-                names = zf.namelist()
-                if "META-INF/container.xml" not in names:
+                self.names = zf.namelist()
+
+                if "META-INF/container.xml" not in self.names:
                     raise ValueError("META-INF/container.xml이 없습니다. 올바른 EPUB 파일이 아닐 수 있습니다.")
 
                 self.file_rows = [
@@ -79,6 +81,8 @@ class EpubEditor:
                         self.opf_dir,
                         self.cover_item.attrib.get("href", "")
                     )
+                else:
+                    self.cover_zip_path = self.find_cover_image_from_cover_page()
         finally:
             try:
                 os.remove(tmp_path)
@@ -156,11 +160,13 @@ class EpubEditor:
     def find_cover_item(self):
         manifest = self.manifest_el()
 
+        # EPUB3: properties="cover-image"
         for item in manifest.findall("opf:item", NS):
             props = item.attrib.get("properties", "")
             if "cover-image" in props.split():
                 return item
 
+        # EPUB2: <meta name="cover" content="cover-id"/>
         for meta in self.metadata_el().findall("opf:meta", NS):
             if meta.attrib.get("name") == "cover":
                 cover_id = meta.attrib.get("content")
@@ -168,6 +174,7 @@ class EpubEditor:
                     if item.attrib.get("id") == cover_id:
                         return item
 
+        # fallback: filename contains cover
         for item in manifest.findall("opf:item", NS):
             mt = item.attrib.get("media-type", "")
             href = item.attrib.get("href", "").lower()
@@ -176,8 +183,74 @@ class EpubEditor:
 
         return None
 
+    def guess_cover_page_paths(self):
+        candidates = []
+        for name in self.names:
+            low = name.lower()
+            if low.endswith((".xhtml", ".html", ".htm")) and "cover" in low:
+                candidates.append(name)
+        return candidates
+
+    def resolve_relative_zip_path(self, page_path: str, href: str) -> str:
+        href = unquote(href).replace("\\", "/")
+        if href.startswith("#") or href.startswith("http://") or href.startswith("https://"):
+            return ""
+        href = href.split("#", 1)[0].split("?", 1)[0]
+        page_dir = str(Path(page_path).parent).replace("\\", "/")
+        if page_dir == ".":
+            page_dir = ""
+        if page_dir:
+            return norm_zip_path(str(Path(page_dir) / href))
+        return norm_zip_path(href)
+
+    def find_cover_image_from_cover_page(self):
+        cover_pages = self.guess_cover_page_paths()
+        if not cover_pages:
+            return None
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+            tmp.write(self.epub_bytes)
+            tmp_path = tmp.name
+
+        try:
+            with zipfile.ZipFile(tmp_path, "r") as zf:
+                names = set(zf.namelist())
+
+                for page in cover_pages:
+                    try:
+                        html = zf.read(page).decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+
+                    patterns = [
+                        r'xlink:href\s*=\s*"([^"]+)"',
+                        r'<image\b[^>]*?\shref\s*=\s*"([^"]+)"',
+                        r'<img\b[^>]*?\ssrc\s*=\s*"([^"]+)"',
+                    ]
+
+                    for pat in patterns:
+                        m = re.search(pat, html, flags=re.IGNORECASE)
+                        if not m:
+                            continue
+
+                        img_path = self.resolve_relative_zip_path(page, m.group(1))
+                        if img_path and img_path in names:
+                            return img_path
+
+            return None
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
     def get_cover_bytes(self):
-        if not self.cover_zip_path:
+        cover_path = self.cover_zip_path
+
+        if not cover_path:
+            cover_path = self.find_cover_image_from_cover_page()
+
+        if not cover_path:
             return None, None
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
@@ -186,64 +259,82 @@ class EpubEditor:
 
         try:
             with zipfile.ZipFile(tmp_path, "r") as zf:
-                if self.cover_zip_path not in zf.namelist():
+                if cover_path not in zf.namelist():
                     return None, None
-                return zf.read(self.cover_zip_path), self.cover_zip_path
+                self.cover_zip_path = cover_path
+                return zf.read(cover_path), cover_path
         finally:
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
 
-    def ensure_cover_item(self, filename: str):
+    def normalize_cover_metadata(self):
         manifest = self.manifest_el()
         metadata = self.metadata_el()
 
-        ext = Path(filename).suffix.lower()
-        if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg"]:
-            ext = ".jpg"
+        if self.cover_item is None:
+            self.cover_item = self.find_cover_item()
 
-        media_type = mimetypes.guess_type("cover" + ext)[0] or "image/jpeg"
+        if self.cover_item is None:
+            self.cover_item = ET.SubElement(manifest, f"{{{NS['opf']}}}item")
 
-        if self.cover_item is not None:
-            props = self.cover_item.attrib.get("properties", "")
-            if "cover-image" not in props.split():
-                self.cover_item.set("properties", (props + " cover-image").strip())
-            self.cover_item.set("media-type", media_type)
-            return self.cover_item
+        self.cover_item.set("id", "cover-image")
+        self.cover_item.set("href", "Images/cover.jpg")
+        self.cover_item.set("media-type", "image/jpeg")
+        self.cover_item.set("properties", "cover-image")
+        self.cover_zip_path = join_zip_path(self.opf_dir, "Images/cover.jpg")
 
-        ids = {i.attrib.get("id") for i in manifest.findall("opf:item", NS)}
-        new_id = "cover-image"
-        n = 1
-        while new_id in ids:
-            n += 1
-            new_id = f"cover-image-{n}"
-
-        href = f"Images/cover{ext}"
-        item = ET.SubElement(manifest, f"{{{NS['opf']}}}item")
-        item.set("id", new_id)
-        item.set("href", href)
-        item.set("media-type", media_type)
-        item.set("properties", "cover-image")
+        # 기존 cover meta 제거 후 하나만 생성
+        for meta in list(metadata.findall("opf:meta", NS)):
+            if meta.attrib.get("name") == "cover":
+                metadata.remove(meta)
 
         meta = ET.SubElement(metadata, f"{{{NS['opf']}}}meta")
         meta.set("name", "cover")
-        meta.set("content", new_id)
+        meta.set("content", "cover-image")
 
-        self.cover_item = item
-        self.cover_zip_path = join_zip_path(self.opf_dir, href)
-        return item
+    def rewrite_cover_page_html(self, html_bytes: bytes) -> bytes:
+        try:
+            html = html_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            html = html_bytes.decode("utf-8", errors="ignore")
+
+        html = re.sub(
+            r'(xlink:href\s*=\s*")[^"]+(")',
+            r'\1../Images/cover.jpg\2',
+            html,
+            flags=re.IGNORECASE
+        )
+        html = re.sub(
+            r'(<image\b[^>]*?\shref\s*=\s*")[^"]+(")',
+            r'\1../Images/cover.jpg\2',
+            html,
+            flags=re.IGNORECASE
+        )
+        html = re.sub(
+            r'(<img\b[^>]*?\ssrc\s*=\s*")[^"]+(")',
+            r'\1../Images/cover.jpg\2',
+            html,
+            flags=re.IGNORECASE
+        )
+
+        return html.encode("utf-8")
 
     def build_epub(self, info: dict, new_cover_bytes=None, new_cover_filename="cover.jpg") -> bytes:
         self.set_info(info)
 
-        cover_target_zip_path = self.cover_zip_path
+        # 새 표지가 있으면 새 표지를 사용, 없으면 기존 표지를 자동 사용
         if new_cover_bytes:
-            item = self.ensure_cover_item(new_cover_filename)
-            cover_target_zip_path = join_zip_path(self.opf_dir, item.attrib.get("href", ""))
-            self.cover_zip_path = cover_target_zip_path
+            final_cover_bytes = new_cover_bytes
+        else:
+            final_cover_bytes, _ = self.get_cover_bytes()
+
+        if final_cover_bytes:
+            self.normalize_cover_metadata()
 
         opf_bytes = ET.tostring(self.root, encoding="utf-8", xml_declaration=True)
+        cover_pages = set(self.guess_cover_page_paths())
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as src:
             src.write(self.epub_bytes)
@@ -262,18 +353,28 @@ class EpubEditor:
 
                     for item in zin.infolist():
                         name = item.filename
+
                         if name == "mimetype":
                             continue
                         if name == self.opf_path:
                             continue
-                        if new_cover_bytes and name == cover_target_zip_path:
+
+                        # 표준 표지 경로는 새로 씀
+                        if final_cover_bytes and name == self.cover_zip_path:
                             continue
-                        zout.writestr(item, zin.read(name))
+
+                        data = zin.read(name)
+
+                        # Cover.xhtml 내부 이미지 경로 보정
+                        if final_cover_bytes and name in cover_pages:
+                            data = self.rewrite_cover_page_html(data)
+
+                        zout.writestr(item, data)
 
                     zout.writestr(self.opf_path, opf_bytes, compress_type=zipfile.ZIP_DEFLATED)
 
-                    if new_cover_bytes and cover_target_zip_path:
-                        zout.writestr(cover_target_zip_path, new_cover_bytes, compress_type=zipfile.ZIP_DEFLATED)
+                    if final_cover_bytes:
+                        zout.writestr(self.cover_zip_path, final_cover_bytes, compress_type=zipfile.ZIP_DEFLATED)
 
             with open(out_path, "rb") as f:
                 return f.read()
