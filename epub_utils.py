@@ -2,7 +2,6 @@ import os
 import re
 import zipfile
 import tempfile
-import mimetypes
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote
@@ -28,6 +27,10 @@ def join_zip_path(base_dir: str, href: str) -> str:
     return norm_zip_path(href)
 
 
+def is_image_path(path: str) -> bool:
+    return path.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
+
+
 class EpubEditor:
     def __init__(self, epub_bytes: bytes):
         self.epub_bytes = epub_bytes
@@ -36,8 +39,11 @@ class EpubEditor:
         self.root = None
         self.cover_item = None
         self.cover_zip_path = None
+        self.cover_page_path = None
         self.file_rows = []
         self.names = []
+        self.spine_ids = []
+        self.id_to_href = {}
         self._read()
 
     def _read(self):
@@ -53,11 +59,7 @@ class EpubEditor:
                     raise ValueError("META-INF/container.xml이 없습니다. 올바른 EPUB 파일이 아닐 수 있습니다.")
 
                 self.file_rows = [
-                    {
-                        "name": info.filename,
-                        "size": info.file_size,
-                        "compressed": info.compress_size,
-                    }
+                    {"name": info.filename, "size": info.file_size, "compressed": info.compress_size}
                     for info in zf.infolist()
                 ]
 
@@ -75,14 +77,16 @@ class EpubEditor:
                 opf_xml = zf.read(self.opf_path)
                 self.root = ET.fromstring(opf_xml)
 
+                self.build_manifest_spine_maps()
+
                 self.cover_item = self.find_cover_item()
                 if self.cover_item is not None:
-                    self.cover_zip_path = join_zip_path(
-                        self.opf_dir,
-                        self.cover_item.attrib.get("href", "")
-                    )
-                else:
-                    self.cover_zip_path = self.find_cover_image_from_cover_page()
+                    self.cover_zip_path = join_zip_path(self.opf_dir, self.cover_item.attrib.get("href", ""))
+
+                if not self.cover_zip_path or self.cover_zip_path not in self.names:
+                    found = self.find_cover_image_deep()
+                    if found:
+                        self.cover_zip_path, self.cover_page_path = found
         finally:
             try:
                 os.remove(tmp_path)
@@ -100,6 +104,23 @@ class EpubEditor:
         if el is None:
             el = ET.SubElement(self.root, f"{{{NS['opf']}}}manifest")
         return el
+
+    def build_manifest_spine_maps(self):
+        self.id_to_href = {}
+        manifest = self.manifest_el()
+        for item in manifest.findall("opf:item", NS):
+            item_id = item.attrib.get("id")
+            href = item.attrib.get("href")
+            if item_id and href:
+                self.id_to_href[item_id] = join_zip_path(self.opf_dir, href)
+
+        self.spine_ids = []
+        spine = self.root.find("opf:spine", NS)
+        if spine is not None:
+            for itemref in spine.findall("opf:itemref", NS):
+                rid = itemref.attrib.get("idref")
+                if rid:
+                    self.spine_ids.append(rid)
 
     def get_dc_all(self, tag: str):
         vals = []
@@ -142,31 +163,25 @@ class EpubEditor:
         }
 
     def set_info(self, info: dict):
-        for key in [
-            "title", "creator", "language", "publisher",
-            "identifier", "date", "rights", "description"
-        ]:
+        for key in ["title", "creator", "language", "publisher", "identifier", "date", "rights", "description"]:
             self.set_dc(key, info.get(key, ""))
 
         metadata = self.metadata_el()
         for el in metadata.findall("dc:subject", NS):
             metadata.remove(el)
 
-        subjects = info.get("subject", "")
-        for subject in [x.strip() for x in subjects.split(",") if x.strip()]:
+        for subject in [x.strip() for x in info.get("subject", "").split(",") if x.strip()]:
             el = ET.SubElement(metadata, f"{{{NS['dc']}}}subject")
             el.text = subject
 
     def find_cover_item(self):
         manifest = self.manifest_el()
 
-        # EPUB3: properties="cover-image"
         for item in manifest.findall("opf:item", NS):
             props = item.attrib.get("properties", "")
             if "cover-image" in props.split():
                 return item
 
-        # EPUB2: <meta name="cover" content="cover-id"/>
         for meta in self.metadata_el().findall("opf:meta", NS):
             if meta.attrib.get("name") == "cover":
                 cover_id = meta.attrib.get("content")
@@ -174,7 +189,6 @@ class EpubEditor:
                     if item.attrib.get("id") == cover_id:
                         return item
 
-        # fallback: filename contains cover
         for item in manifest.findall("opf:item", NS):
             mt = item.attrib.get("media-type", "")
             href = item.attrib.get("href", "").lower()
@@ -183,13 +197,35 @@ class EpubEditor:
 
         return None
 
-    def guess_cover_page_paths(self):
+    def html_page_candidates(self):
         candidates = []
+
+        # 1순위: spine 첫 페이지들
+        for rid in self.spine_ids[:8]:
+            p = self.id_to_href.get(rid)
+            if p and p.lower().endswith((".xhtml", ".html", ".htm")):
+                candidates.append(p)
+
+        # 2순위: 이름에 cover/title 들어간 페이지
         for name in self.names:
             low = name.lower()
-            if low.endswith((".xhtml", ".html", ".htm")) and "cover" in low:
+            if low.endswith((".xhtml", ".html", ".htm")) and ("cover" in low or "title" in low):
                 candidates.append(name)
-        return candidates
+
+        # 3순위: 모든 html/xhtml
+        for name in self.names:
+            low = name.lower()
+            if low.endswith((".xhtml", ".html", ".htm")):
+                candidates.append(name)
+
+        # dedupe
+        seen = set()
+        out = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
 
     def resolve_relative_zip_path(self, page_path: str, href: str) -> str:
         href = unquote(href).replace("\\", "/")
@@ -203,11 +239,21 @@ class EpubEditor:
             return norm_zip_path(str(Path(page_dir) / href))
         return norm_zip_path(href)
 
-    def find_cover_image_from_cover_page(self):
-        cover_pages = self.guess_cover_page_paths()
-        if not cover_pages:
-            return None
+    def extract_image_refs_from_html(self, html: str):
+        refs = []
 
+        patterns = [
+            r'xlink:href\s*=\s*[\'"]([^\'"]+)[\'"]',
+            r'<image\b[^>]*?\shref\s*=\s*[\'"]([^\'"]+)[\'"]',
+            r'<img\b[^>]*?\ssrc\s*=\s*[\'"]([^\'"]+)[\'"]',
+        ]
+
+        for pat in patterns:
+            refs.extend(re.findall(pat, html, flags=re.IGNORECASE))
+
+        return refs
+
+    def find_cover_image_deep(self):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
             tmp.write(self.epub_bytes)
             tmp_path = tmp.name
@@ -216,26 +262,26 @@ class EpubEditor:
             with zipfile.ZipFile(tmp_path, "r") as zf:
                 names = set(zf.namelist())
 
-                for page in cover_pages:
+                for page in self.html_page_candidates():
+                    if page not in names:
+                        continue
+
                     try:
                         html = zf.read(page).decode("utf-8", errors="ignore")
                     except Exception:
                         continue
 
-                    patterns = [
-                        r'xlink:href\s*=\s*"([^"]+)"',
-                        r'<image\b[^>]*?\shref\s*=\s*"([^"]+)"',
-                        r'<img\b[^>]*?\ssrc\s*=\s*"([^"]+)"',
-                    ]
+                    refs = self.extract_image_refs_from_html(html)
+                    for ref in refs:
+                        img_path = self.resolve_relative_zip_path(page, ref)
+                        if img_path and img_path in names and is_image_path(img_path):
+                            return img_path, page
 
-                    for pat in patterns:
-                        m = re.search(pat, html, flags=re.IGNORECASE)
-                        if not m:
-                            continue
-
-                        img_path = self.resolve_relative_zip_path(page, m.group(1))
-                        if img_path and img_path in names:
-                            return img_path
+                # 마지막 fallback: 이름에 cover가 들어간 이미지
+                for name in self.names:
+                    low = name.lower()
+                    if is_image_path(name) and "cover" in low:
+                        return name, None
 
             return None
         finally:
@@ -248,7 +294,9 @@ class EpubEditor:
         cover_path = self.cover_zip_path
 
         if not cover_path:
-            cover_path = self.find_cover_image_from_cover_page()
+            found = self.find_cover_image_deep()
+            if found:
+                cover_path, self.cover_page_path = found
 
         if not cover_path:
             return None, None
@@ -285,7 +333,6 @@ class EpubEditor:
         self.cover_item.set("properties", "cover-image")
         self.cover_zip_path = join_zip_path(self.opf_dir, "Images/cover.jpg")
 
-        # 기존 cover meta 제거 후 하나만 생성
         for meta in list(metadata.findall("opf:meta", NS)):
             if meta.attrib.get("name") == "cover":
                 metadata.remove(meta)
@@ -300,31 +347,15 @@ class EpubEditor:
         except UnicodeDecodeError:
             html = html_bytes.decode("utf-8", errors="ignore")
 
-        html = re.sub(
-            r'(xlink:href\s*=\s*")[^"]+(")',
-            r'\1../Images/cover.jpg\2',
-            html,
-            flags=re.IGNORECASE
-        )
-        html = re.sub(
-            r'(<image\b[^>]*?\shref\s*=\s*")[^"]+(")',
-            r'\1../Images/cover.jpg\2',
-            html,
-            flags=re.IGNORECASE
-        )
-        html = re.sub(
-            r'(<img\b[^>]*?\ssrc\s*=\s*")[^"]+(")',
-            r'\1../Images/cover.jpg\2',
-            html,
-            flags=re.IGNORECASE
-        )
+        html = re.sub(r'(xlink:href\s*=\s*[\'"])[^\'"]+([\'"])', r'\1../Images/cover.jpg\2', html, flags=re.IGNORECASE)
+        html = re.sub(r'(<image\b[^>]*?\shref\s*=\s*[\'"])[^\'"]+([\'"])', r'\1../Images/cover.jpg\2', html, flags=re.IGNORECASE)
+        html = re.sub(r'(<img\b[^>]*?\ssrc\s*=\s*[\'"])[^\'"]+([\'"])', r'\1../Images/cover.jpg\2', html, flags=re.IGNORECASE)
 
         return html.encode("utf-8")
 
     def build_epub(self, info: dict, new_cover_bytes=None, new_cover_filename="cover.jpg") -> bytes:
         self.set_info(info)
 
-        # 새 표지가 있으면 새 표지를 사용, 없으면 기존 표지를 자동 사용
         if new_cover_bytes:
             final_cover_bytes = new_cover_bytes
         else:
@@ -334,7 +365,14 @@ class EpubEditor:
             self.normalize_cover_metadata()
 
         opf_bytes = ET.tostring(self.root, encoding="utf-8", xml_declaration=True)
-        cover_pages = set(self.guess_cover_page_paths())
+
+        cover_pages = set()
+        if self.cover_page_path:
+            cover_pages.add(self.cover_page_path)
+        for p in self.html_page_candidates():
+            low = p.lower()
+            if "cover" in low or "title" in low:
+                cover_pages.add(p)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as src:
             src.write(self.epub_bytes)
@@ -359,13 +397,12 @@ class EpubEditor:
                         if name == self.opf_path:
                             continue
 
-                        # 표준 표지 경로는 새로 씀
+                        # 표준 표지는 새로 씀
                         if final_cover_bytes and name == self.cover_zip_path:
                             continue
 
                         data = zin.read(name)
 
-                        # Cover.xhtml 내부 이미지 경로 보정
                         if final_cover_bytes and name in cover_pages:
                             data = self.rewrite_cover_page_html(data)
 
