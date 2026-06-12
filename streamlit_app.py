@@ -36,8 +36,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">📚 EPUB Metadata Editor Web v2</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">EPUB 메타데이터와 표지를 웹에서 수정하고, 리디 책장 표지 인식용으로 자동 보정합니다.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">📚 EPUB Metadata Editor Web v3</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">EPUB 메타데이터와 표지를 웹에서 수정하고, 리디 책장 표지 인식용으로 자동 보정합니다. Web v3</div>', unsafe_allow_html=True)
 
 st.markdown("""
 <div class="warning-box">
@@ -90,6 +90,8 @@ with left:
     st.write(f"파일명: `{uploaded.name}`")
     st.write(f"OPF: `{editor.opf_path}`")
     st.write(f"표지 경로: `{editor.cover_zip_path or '감지 안 됨'}`")
+    if editor.cover_page_path:
+        st.write(f"표지 페이지: `{editor.cover_page_path}`")
 
 with right:
     st.subheader("메타데이터")
