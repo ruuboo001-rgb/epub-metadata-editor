@@ -36,8 +36,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">📚 EPUB Metadata Editor</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">EPUB 메타데이터와 표지를 웹에서 간단히 수정합니다.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">📚 EPUB Metadata Editor Web v2</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">EPUB 메타데이터와 표지를 웹에서 수정하고, 리디 책장 표지 인식용으로 자동 보정합니다.</div>', unsafe_allow_html=True)
 
 st.markdown("""
 <div class="warning-box">
