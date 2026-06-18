@@ -36,8 +36,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">📚 EPUB Metadata Editor Web v3</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">EPUB 메타데이터와 표지를 웹에서 수정하고, 리디 책장 표지 인식용으로 자동 보정합니다. Web v3</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">📚 EPUB Metadata Editor Web v4</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">EPUB 메타데이터와 표지를 웹에서 수정하고, 리디 책장 표지와 내부 목차를 자동 보정합니다. Web v4</div>', unsafe_allow_html=True)
 
 st.markdown("""
 <div class="warning-box">
@@ -93,6 +93,15 @@ with left:
     if editor.cover_page_path:
         st.write(f"표지 페이지: `{editor.cover_page_path}`")
 
+    st.subheader("목차 확인")
+    toc_status = editor.toc_status()
+    st.write(f"기존 nav.xhtml: `{'있음' if toc_status['has_nav'] else '없음'}` {toc_status['nav_href']}")
+    st.write(f"기존 toc.ncx: `{'있음' if toc_status['has_ncx'] else '없음'}` {toc_status['ncx_href']}")
+    st.write(f"spine toc 연결: `{toc_status['spine_toc'] or '없음'}`")
+    st.write(f"본문 기준 자동 목차: `{toc_status['entry_count']}개`")
+    st.caption("저장 시 목차 전용 페이지를 본문에 추가하지 않고, 리디가 읽는 내부 nav.xhtml/toc.ncx만 생성합니다.")
+
+
 with right:
     st.subheader("메타데이터")
 
@@ -143,6 +152,17 @@ with right:
             )
         except Exception as e:
             st.error(f"EPUB 생성 실패: {e}")
+
+st.divider()
+st.subheader("자동 분석된 목차")
+
+toc_entries = editor.toc_status()["entries"]
+if toc_entries:
+    toc_df = pd.DataFrame(toc_entries)
+    toc_df.insert(0, "no", range(1, len(toc_df) + 1))
+    st.dataframe(toc_df[["no", "title", "href", "source"]], use_container_width=True, hide_index=True)
+else:
+    st.warning("목차 후보를 찾지 못했습니다. 본문 XHTML에 h1/h2/h3 제목이 있는지 확인해주세요.")
 
 st.divider()
 st.subheader("EPUB 내부 파일 목록")
