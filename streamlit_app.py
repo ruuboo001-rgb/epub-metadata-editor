@@ -5,7 +5,7 @@ from pathlib import Path
 from epub_utils import EpubEditor
 
 st.set_page_config(
-    page_title="EPUB Metadata Editor",
+    page_title="EPUB Metadata Editor Web v6",
     page_icon="📚",
     layout="wide",
 )
@@ -21,12 +21,6 @@ st.markdown("""
     color: #8a7a6a;
     margin-bottom: 1.2rem;
 }
-.card {
-    border: 1px solid #e0d4c8;
-    border-radius: 18px;
-    padding: 1rem;
-    background: #fffaf5;
-}
 .warning-box {
     border: 1px solid #e6c27a;
     background: #fff8e5;
@@ -36,13 +30,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">📚 EPUB Metadata Editor Web v4</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">EPUB 메타데이터와 표지를 웹에서 수정하고, 리디 책장 표지와 내부 목차를 자동 보정합니다. Web v4</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">📚 EPUB Metadata Editor Web v6</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">EPUB 메타데이터, 표지, 선택적 리디용 목차를 웹에서 보정합니다.</div>', unsafe_allow_html=True)
 
 st.markdown("""
 <div class="warning-box">
-업로드된 EPUB은 서버에 영구 저장하지 않고, 수정 결과를 다운로드 파일로만 제공합니다.
-그래도 개인 파일이나 저작권 파일을 공개 서버에 올릴 때는 주의하세요.
+업로드된 EPUB은 서버에 영구 저장하지 않고, 수정 결과를 다운로드 파일로만 제공합니다.<br/>
+기본값은 <b>목차를 수정하지 않는 것</b>입니다. 기존 목차가 완벽하면 목차 보정을 켜지 마세요.
 </div>
 """, unsafe_allow_html=True)
 
@@ -93,14 +87,34 @@ with left:
     if editor.cover_page_path:
         st.write(f"표지 페이지: `{editor.cover_page_path}`")
 
-    st.subheader("목차 확인")
-    toc_status = editor.toc_status()
-    st.write(f"기존 nav.xhtml: `{'있음' if toc_status['has_nav'] else '없음'}` {toc_status['nav_href']}")
-    st.write(f"기존 toc.ncx: `{'있음' if toc_status['has_ncx'] else '없음'}` {toc_status['ncx_href']}")
-    st.write(f"spine toc 연결: `{toc_status['spine_toc'] or '없음'}`")
-    st.write(f"본문 기준 자동 목차: `{toc_status['entry_count']}개`")
-    st.caption("저장 시 목차 전용 페이지를 본문에 추가하지 않고, 리디가 읽는 내부 nav.xhtml/toc.ncx만 생성합니다.")
+    st.subheader("목차 옵션")
+    fix_toc = st.checkbox(
+        "리디용 목차 자동 보정 사용",
+        value=False,
+        help="기본값은 꺼짐입니다. 기존 목차가 완벽하면 켜지 마세요."
+    )
 
+    default_regex = r"^\s*(프롤로그|에필로그|\d+\s*화|외전|후기|#?\d+\.|제?\s*\d+\s*장)"
+    toc_regex = st.text_input(
+        "목차 제목 정규식",
+        value=default_regex,
+        help="이 정규식에 맞는 제목만 목차로 만듭니다. 비우면 spine의 제목 후보를 모두 사용합니다."
+    )
+
+    toc_status = editor.toc_status(toc_regex if fix_toc else "")
+    if toc_status.get("regex_error"):
+        st.error(toc_status["regex_error"])
+
+    with st.expander("목차 확인", expanded=fix_toc):
+        st.write(f"기존 nav.xhtml: `{'있음' if toc_status['has_nav'] else '없음'}` {toc_status['nav_href']}")
+        st.write(f"기존 toc.ncx: `{'있음' if toc_status['has_ncx'] else '없음'}` {toc_status['ncx_href']}")
+        st.write(f"spine toc 연결: `{toc_status['spine_toc'] or '없음'}`")
+        st.write(f"정규식 적용 후 목차 후보: `{toc_status['entry_count']}개`")
+
+        if not fix_toc:
+            st.info("현재 설정: 목차를 수정하지 않습니다. 기존 EPUB 목차가 그대로 유지됩니다.")
+        else:
+            st.caption("저장 시 아래 후보로 내부 nav.xhtml/toc.ncx를 생성합니다. 목차 전용 페이지는 본문에 추가하지 않습니다.")
 
 with right:
     st.subheader("메타데이터")
@@ -139,11 +153,15 @@ with right:
                 new_info,
                 new_cover_bytes=new_cover_bytes,
                 new_cover_filename=new_cover_filename,
+                fix_toc=fix_toc,
+                toc_regex=toc_regex if fix_toc else "",
             )
 
             output_name = Path(uploaded.name).stem + "_edited.epub"
 
             st.success("수정된 EPUB을 만들었습니다.")
+            if not fix_toc:
+                st.info("목차 자동 보정을 사용하지 않았으므로 기존 목차는 그대로 유지됩니다.")
             st.download_button(
                 "수정된 EPUB 다운로드",
                 data=result,
@@ -154,15 +172,15 @@ with right:
             st.error(f"EPUB 생성 실패: {e}")
 
 st.divider()
-st.subheader("자동 분석된 목차")
+st.subheader("자동 분석된 목차 후보")
 
-toc_entries = editor.toc_status()["entries"]
+toc_entries = toc_status["entries"]
 if toc_entries:
     toc_df = pd.DataFrame(toc_entries)
     toc_df.insert(0, "no", range(1, len(toc_df) + 1))
     st.dataframe(toc_df[["no", "title", "href", "source"]], use_container_width=True, hide_index=True)
 else:
-    st.warning("목차 후보를 찾지 못했습니다. 본문 XHTML에 h1/h2/h3 제목이 있는지 확인해주세요.")
+    st.info("현재 조건에 맞는 목차 후보가 없습니다. 기존 목차를 유지하려면 목차 자동 보정을 끄면 됩니다.")
 
 st.divider()
 st.subheader("EPUB 내부 파일 목록")

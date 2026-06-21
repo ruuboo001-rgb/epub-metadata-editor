@@ -478,8 +478,14 @@ class EpubEditor:
 
         return fallback
 
-    def collect_toc_entries(self):
+    def collect_toc_entries(self, title_regex: str = ""):
         entries = []
+        pattern = None
+        if title_regex and title_regex.strip():
+            try:
+                pattern = re.compile(title_regex.strip())
+            except re.error as e:
+                raise ValueError(f"목차 정규식 오류: {e}")
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
             tmp.write(self.epub_bytes)
@@ -508,6 +514,9 @@ class EpubEditor:
                     if normalized in ["cover", "table of contents", "contents", "toc", "차례", "목차", "시작"]:
                         continue
 
+                    if pattern and not pattern.search(title):
+                        continue
+
                     entries.append({"title": title, "href": href, "source": "spine-h-title"})
         finally:
             try:
@@ -517,11 +526,16 @@ class EpubEditor:
 
         return entries
 
-    def toc_status(self):
+    def toc_status(self, title_regex: str = ""):
         nav_item = self.find_existing_nav_item()
         ncx_item = self.find_existing_ncx_item()
         spine = self.spine_el()
-        entries = self.collect_toc_entries()
+        try:
+            entries = self.collect_toc_entries(title_regex)
+            regex_error = ""
+        except ValueError as e:
+            entries = []
+            regex_error = str(e)
 
         return {
             "has_nav": nav_item is not None,
@@ -531,6 +545,7 @@ class EpubEditor:
             "spine_toc": spine.attrib.get("toc", ""),
             "entry_count": len(entries),
             "entries": entries,
+            "regex_error": regex_error,
         }
 
     def ensure_unique_manifest_id(self, base_id):
@@ -619,8 +634,8 @@ class EpubEditor:
 """
         return xml.encode("utf-8")
 
-    def normalize_toc_metadata(self):
-        entries = self.collect_toc_entries()
+    def normalize_toc_metadata(self, title_regex: str = ""):
+        entries = self.collect_toc_entries(title_regex)
         manifest = self.manifest_el()
         spine, itemrefs = self.spine_itemrefs()
 
@@ -658,7 +673,7 @@ class EpubEditor:
             "ncx_bytes": self.build_ncx(entries),
         }
 
-    def build_epub(self, info: dict, new_cover_bytes=None, new_cover_filename="cover.jpg") -> bytes:
+    def build_epub(self, info: dict, new_cover_bytes=None, new_cover_filename="cover.jpg", fix_toc: bool = False, toc_regex: str = "") -> bytes:
         self.set_info(info)
 
         if new_cover_bytes:
@@ -669,7 +684,7 @@ class EpubEditor:
         if final_cover_bytes:
             self.normalize_cover_metadata()
 
-        toc_result = self.normalize_toc_metadata()
+        toc_result = self.normalize_toc_metadata(toc_regex) if fix_toc else None
 
         opf_bytes = ET.tostring(self.root, encoding="utf-8", xml_declaration=True)
 
